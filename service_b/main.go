@@ -1,14 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/zipkin"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 )
 
 type AddressResponse struct {
@@ -37,7 +45,27 @@ type TemperatureResponse struct {
 	TempK float64 `json:"temp_K"`
 }
 
+func initTracer() {
+	exporter, err := zipkin.New("http://zipkin:9411/api/v2/spans")
+	if err != nil {
+		log.Fatalf("Fail to create Zipkin exporter: %v", err)
+	}
+
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exporter),
+		trace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("service-b"),
+		)),
+	)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+}
+
 func main() {
+	initTracer()
+
 	r := chi.NewRouter()
 
 	r.Use(middleware.Logger)
@@ -70,7 +98,10 @@ func checkCepMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func getAddressFromViaCEP(cep string) (*AddressResponse, error) {
+func getAddressFromViaCEP(cep string, ctx context.Context) (*AddressResponse, error) {
+	_, span := otel.Tracer("service-b").Start(ctx, "get-cep-location")
+	defer span.End()
+
 	url := fmt.Sprintf("https://viacep.com.br/ws/%s/json/", cep)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -89,7 +120,10 @@ func getAddressFromViaCEP(cep string) (*AddressResponse, error) {
 	return &address, nil
 }
 
-func getWeather(city string) (*WeatherResponse, error) {
+func getWeather(city string, ctx context.Context) (*WeatherResponse, error) {
+	_, span := otel.Tracer("service-b").Start(ctx, "get-weather")
+	defer span.End()
+
 	cityEncoded := url.QueryEscape(city)
 	url := fmt.Sprintf("https://api.weatherapi.com/v1/current.json?key=e1fece5bce574041a9f130048241703&q=%s&aqi=no", cityEncoded)
 	resp, err := http.Get(url)
@@ -132,13 +166,16 @@ func celsiusToKelvin(celsius float64) float64 {
 func handleGetTemperatureByCEP(w http.ResponseWriter, r *http.Request) {
 	cep := chi.URLParam(r, "cep")
 
-	address, err := getAddressFromViaCEP(cep)
+	ctx, span := otel.Tracer("service-b").Start(r.Context(), "get-cep-temperature")
+	defer span.End()
+
+	address, err := getAddressFromViaCEP(cep, ctx)
 	if err != nil {
 		http.Error(w, "can not find zipcode", http.StatusNotFound)
 		return
 	}
 
-	weather, err := getWeather(address.Localidade)
+	weather, err := getWeather(address.Localidade, ctx)
 	if err != nil {
 		http.Error(w, "can not find weather", http.StatusNotFound)
 		return
